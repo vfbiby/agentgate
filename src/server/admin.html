@@ -2350,16 +2350,17 @@
                                 <button class="text-sm text-gray-500 hover:underline" onclick="setGroupVisibility('${escapeHtml(provider)}', false)">Select none</button>
                             </div>
                         </div>
-                        <div class="space-y-1" id="vg-${escapeHtml(provider)}"></div>`;
+                        <div class="grid grid-cols-2 gap-x-8 gap-y-1" id="vg-${escapeHtml(provider)}"></div>`;
                     const grid = card.querySelector(
                         `#vg-${CSS.escape(provider)}`
                     );
                     models.forEach((m) => {
                         const row = document.createElement("div");
                         row.className =
-                            "flex items-center justify-between text-sm text-gray-700";
+                            "flex items-center gap-6 text-sm text-gray-700";
                         const isVisible = !visibilityState.hidden.includes(m.id);
                         const oneM = visibilityState.one_m.includes(m.id);
+                        row.dataset.ctx = oneM ? "1m" : "200k";
 
                         // Left: visible checkbox + model name, adjacent.
                         const visibleLabel = document.createElement("label");
@@ -2371,12 +2372,12 @@
                         visibleBox.dataset.model = m.id;
                         visibleBox.dataset.kind = "visible";
                         visibleBox.addEventListener("change", () => {
-                            const oneMBox = row.querySelector(
-                                'input[data-kind="onem"]'
+                            renderContextControl(
+                                row,
+                                m.id,
+                                visibleBox.checked,
+                                row.dataset.ctx === "1m"
                             );
-                            if (oneMBox) {
-                                oneMBox.disabled = !visibleBox.checked;
-                            }
                         });
                         visibleLabel.appendChild(visibleBox);
                         const name = document.createElement("span");
@@ -2384,25 +2385,66 @@
                         name.textContent = m.id;
                         visibleLabel.appendChild(name);
 
-                        // Right: 1M checkbox + short label.
-                        const oneMLabel = document.createElement("label");
-                        oneMLabel.className =
-                            "flex items-center gap-1.5 cursor-pointer";
-                        const oneMBox = document.createElement("input");
-                        oneMBox.type = "checkbox";
-                        oneMBox.checked = oneM;
-                        oneMBox.disabled = !isVisible;
-                        oneMBox.dataset.model = m.id;
-                        oneMBox.dataset.kind = "onem";
-                        oneMLabel.appendChild(oneMBox);
-                        oneMLabel.appendChild(document.createTextNode("1M"));
-
+                        // Right: 200K/1M radio pair, or a gray placeholder
+                        // when the model is hidden.
+                        const ctxControl = document.createElement("span");
+                        ctxControl.className = "ctx-control flex items-center gap-3";
                         row.appendChild(visibleLabel);
-                        row.appendChild(oneMLabel);
+                        row.appendChild(ctxControl);
+                        renderContextControl(row, m.id, isVisible, oneM);
                         grid.appendChild(row);
                     });
                     container.appendChild(card);
                 });
+            }
+
+            // Render the right-hand context control for one model row:
+            // a 200K/1M radio pair for visible models, a gray placeholder
+            // for hidden ones. The pending choice is kept in row.dataset.ctx.
+            function renderContextControl(row, model, isVisible, oneM) {
+                if (isVisible) {
+                    row.dataset.ctx = oneM ? "1m" : "200k";
+                }
+                const control = row.querySelector(".ctx-control");
+                if (!control) return;
+                control.innerHTML = "";
+                if (!isVisible) {
+                    const placeholder = document.createElement("span");
+                    placeholder.className = "text-gray-400";
+                    placeholder.textContent = "\u9690\u85cf";
+                    control.appendChild(placeholder);
+                    return;
+                }
+                const makeRadio = (value, text) => {
+                    const label = document.createElement("label");
+                    label.className =
+                        "flex items-center gap-1.5 cursor-pointer";
+                    const radio = document.createElement("input");
+                    radio.type = "radio";
+                    radio.name = "ctx-" + model;
+                    radio.value = value;
+                    radio.checked =
+                        (value === "1m") === (row.dataset.ctx === "1m");
+                    label.appendChild(radio);
+                    label.appendChild(document.createTextNode(text));
+                    return label;
+                };
+                const twoHundredK = makeRadio("200k", "200K");
+                const oneMRadio = makeRadio("1m", "1M");
+                oneMRadio.querySelector("input").addEventListener(
+                    "change",
+                    () => {
+                        row.dataset.ctx = "1m";
+                    }
+                );
+                twoHundredK.querySelector("input").addEventListener(
+                    "change",
+                    () => {
+                        row.dataset.ctx = "200k";
+                    }
+                );
+                control.appendChild(twoHundredK);
+                control.appendChild(oneMRadio);
             }
 
             function setGroupVisibility(provider, visible) {
@@ -2413,12 +2455,13 @@
                     .forEach((cb) => {
                         if (cb.dataset.kind === "visible") {
                             cb.checked = visible;
-                            const oneMBox = cb
-                                .closest("div")
-                                .querySelector('input[data-kind="onem"]');
-                            if (oneMBox) {
-                                oneMBox.disabled = !visible;
-                            }
+                            const row = cb.closest("div");
+                            renderContextControl(
+                                row,
+                                cb.dataset.model,
+                                visible,
+                                row.dataset.ctx === "1m"
+                            );
                         }
                     });
             }
@@ -2433,10 +2476,14 @@
                     if (cb.dataset.kind === "visible" && !cb.checked) {
                         hidden.push(cb.dataset.model);
                     }
-                    if (cb.dataset.kind === "onem" && cb.checked && !cb.disabled) {
-                        oneM.push(cb.dataset.model);
-                    }
                 });
+                document
+                    .querySelectorAll(
+                        '#visibility-groups input[type=radio][value="1m"]:checked'
+                    )
+                    .forEach((radio) => {
+                        oneM.push(radio.dataset.model);
+                    });
                 try {
                     const response = await fetch("/api/model-visibility", {
                         method: "POST",
