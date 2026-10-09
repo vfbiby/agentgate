@@ -72,6 +72,13 @@ Notes:
   Names exactly registered by a provider are never auto-mapped.
 - A web admin UI is served at the same port (`/`).
 
+## Docs
+
+- [docs/gateway-model-discovery-filters.md](docs/gateway-model-discovery-filters.md) —
+  Claude Code `/model` 网关模型发现的三层过滤规则（逆向自 v2.1.293，含对策）
+- [docs/zsh-integration.md](docs/zsh-integration.md) —
+  zsh 函数接入模板：环境隔离、防变量泄漏清单、多网关共存
+
 ## License
 
 MIT, same as upstream. Upstream © 2025 9j. Changes in this fork © 2026 contributors.
