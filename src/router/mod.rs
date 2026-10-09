@@ -115,6 +115,22 @@ impl Router {
     /// Route an incoming request to the appropriate model
     /// Priority: websearch > subagent > think > background > auto-map > default
     pub fn route(&self, request: &mut AnthropicRequest) -> Result<RouteDecision> {
+        // -1. Strip the "[1m]" 1M-context suffix (case-insensitive) before
+        // any routing logic. Claude Code declares 1M context this way, but
+        // upstream gateways reject the suffix in model names, and none of the
+        // routing rules (slot aliases, auto-map, background) need it.
+        {
+            let lower = request.model.to_ascii_lowercase();
+            if lower.ends_with("[1m]") && request.model.len() >= 4 {
+                let stripped = request.model[..request.model.len() - 4].to_string();
+                debug!(
+                    "🔀 Stripped 1M context suffix: '{}' -> '{}'",
+                    request.model, stripped
+                );
+                request.model = stripped;
+            }
+        }
+
         // 0a. claude-* slot alias (gateway model discovery): a name that is
         // exactly "claude-" + a registered model resolves to that model.
         // Sanitized slot ids (Claude Code only accepts [a-z0-9-] ids, so
@@ -317,6 +333,34 @@ mod tests {
             system: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn test_strip_1m_suffix() {
+        let config = create_test_config();
+        let registered: HashSet<String> = ["gpt-6.1-sol", "claude-opus-5-5"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let router = Router::new(config, registered);
+
+        // Suffix stripped, then slot alias resolution applies.
+        let mut request = create_simple_request("Hi");
+        request.model = "claude-gpt-6-1-sol[1m]".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "gpt-6.1-sol");
+
+        // Case-insensitive suffix; exact registered name skips auto-map.
+        let mut request = create_simple_request("Hi");
+        request.model = "gpt-6.1-sol[1M]".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "gpt-6.1-sol");
+
+        // Names without the suffix are untouched.
+        let mut request = create_simple_request("Hi");
+        request.model = "claude-opus-5-5".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "claude-opus-5-5");
     }
 
     #[test]
