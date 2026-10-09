@@ -71,6 +71,45 @@ settings.json 里**只要存在 `availableModels` 键**，`/model` 的每个选�
 
 （Opus/Haiku/Fable 同构。）代价：设置后该档位按钮直接发送映射的名字。
 
+## 1M 上下文声明：`[1m]` 尾缀
+
+Claude Code 声明 1M 上下文的官方方式是在模型名后加 `[1m]`
+（对目录外模型的警告原文：*append [1m] to the model name for 1M*）：
+
+- 带尾缀 → 按 1M 处理（/context、自动压缩阈值），Claude Code 发请求前会自己剥掉尾缀
+- 不带 → 对目录外模型假设 200k，并在该线触发自动压缩
+  （可用 `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 关闭强制压缩，
+  退回「等 API 自己报错」的旧行为）
+
+对本项目的影响：上游中转站**不认**带 `[1m]` 的模型名，所以本 fork 的路由入口会先
+剥掉 `[1m]` 尾缀再做插槽解析/转发——网关配置和 admin UI 的 modelPicker 行可以放心
+使用带 `[1m]` 的名字声明 1M。注意 `[1m]` 只应加在真支持 1M 的模型上（给 272k 的
+模型声明 1M 会让自动压缩失去保护意义）。
+
+## modelPicker：完全自定义 /model 列表
+
+settings.json 支持 `modelPicker`（v2.1.293 逆向确认的行字段）：
+
+```json
+"modelPicker": {
+  "replaceBuiltInOptions": true,
+  "options": [
+    { "model": "claude-gemini-3-8-flash-medium[1m]",
+      "label": "gemini-3.8-flash-medium",
+      "behavesAs": "claude-sonnet-5-5" }
+  ]
+}
+```
+
+- `model`：发送给网关的 id，允许带 `[1m]` 尾缀
+- `label` / `description`：自定义该行显示（覆盖 id 美化）
+- `behavesAs`：把目录外 id 映射到目录内已知模型——消除「isn't described by model
+  catalog」警告，并继承其目录行为
+- `replaceBuiltInOptions: true`：`/model` 只显示 Default + 这些行（内置档位、
+  网关发现列表全部隐藏）
+- 本项目 admin UI 的 Visibility/Tier Mapping 与之配合：Visibility 管
+  `/v1/models`（API 层可见性），modelPicker 管选择器显示层
+
 ## 本项目的组合拳
 
 1. `/v1/models` 对非 claude 模型返回净化插槽 id + 真名 display_name（过第 1、2 层）
