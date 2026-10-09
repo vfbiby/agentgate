@@ -194,6 +194,13 @@
                             Tier Mapping
                         </button>
                         <button
+                            onclick="showTab('visibility')"
+                            id="tab-visibility"
+                            class="w-full text-left px-4 py-3 rounded-lg hover:bg-gray-50 transition-colors text-[15px] text-gray-600"
+                        >
+                            Visibility
+                        </button>
+                        <button
                             onclick="showTab('settings')"
                             id="tab-settings"
                             class="w-full text-left px-4 py-3 rounded-lg hover:bg-gray-50 transition-colors text-[15px] text-gray-600"
@@ -1663,6 +1670,36 @@
                     ></div>
                 </div>
 
+                <!-- Visibility Tab -->
+                <div id="content-visibility" class="tab-content hidden">
+                    <h1 class="text-4xl font-bold mb-3">Model Visibility</h1>
+                    <p class="text-gray-600 text-lg mb-12">
+                        Checked models appear in clients'
+                        <code>/model</code>
+                        picker (gateway discovery). Hidden models stay callable
+                        via <code>--model</code> and remain usable in Tier
+                        Mapping — visibility only affects discovery.
+                    </p>
+
+                    <div
+                        id="visibility-groups"
+                        class="space-y-6 mb-6"
+                    >
+                        <div class="text-gray-500">Loading…</div>
+                    </div>
+
+                    <button
+                        onclick="saveModelVisibility()"
+                        class="btn-primary text-sm py-3 px-6"
+                    >
+                        💾 Save Visibility
+                    </button>
+                    <div
+                        id="visibility-save-status"
+                        class="mt-4 text-sm text-gray-600"
+                    ></div>
+                </div>
+
                 <!-- Settings Tab -->
                 <div id="content-settings" class="tab-content hidden">
                     <h1 class="text-4xl font-bold mb-3">Settings</h1>
@@ -2256,6 +2293,132 @@
                     loadRouterTab();
                 } else if (tab === "tiers") {
                     loadTierMapping();
+                } else if (tab === "visibility") {
+                    loadModelVisibility();
+                }
+            }
+
+            // Model Visibility (which models appear in gateway discovery)
+            let visibilityState = { models: [], hidden: [] };
+
+            async function loadModelVisibility() {
+                try {
+                    const response = await fetch("/api/model-visibility");
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    visibilityState = await response.json();
+                    renderVisibilityGroups();
+                } catch (error) {
+                    console.error("Failed to load model visibility:", error);
+                    notifyError("Failed to load model visibility");
+                }
+            }
+
+            function renderVisibilityGroups() {
+                const container =
+                    document.getElementById("visibility-groups");
+                if (!container) return;
+
+                // Group by provider, preserving order; dedupe by model id.
+                const groups = [];
+                const byProvider = {};
+                const seen = new Set();
+                visibilityState.models.forEach((m) => {
+                    if (seen.has(m.id)) return;
+                    seen.add(m.id);
+                    if (!byProvider[m.provider]) {
+                        byProvider[m.provider] = [];
+                        groups.push(m.provider);
+                    }
+                    byProvider[m.provider].push(m);
+                });
+
+                container.innerHTML = "";
+                groups.forEach((provider) => {
+                    const models = byProvider[provider];
+                    const card = document.createElement("div");
+                    card.className = "card";
+                    const visibleCount = models.filter(
+                        (m) => !visibilityState.hidden.includes(m.id)
+                    ).length;
+                    card.innerHTML = `
+                        <div class="flex items-center justify-between mb-4">
+                            <h2 class="text-xl font-bold">${escapeHtml(provider)}
+                                <span class="text-sm text-gray-500 font-normal">(${visibleCount}/${models.length} visible)</span>
+                            </h2>
+                            <div class="space-x-2">
+                                <button class="text-sm text-blue-600 hover:underline" onclick="setGroupVisibility('${escapeHtml(provider)}', true)">Select all</button>
+                                <button class="text-sm text-gray-500 hover:underline" onclick="setGroupVisibility('${escapeHtml(provider)}', false)">Select none</button>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2" id="vg-${escapeHtml(provider)}"></div>`;
+                    const grid = card.querySelector(
+                        `#vg-${CSS.escape(provider)}`
+                    );
+                    models.forEach((m) => {
+                        const label = document.createElement("label");
+                        label.className =
+                            "flex items-center gap-2 text-sm text-gray-700";
+                        const checkbox = document.createElement("input");
+                        checkbox.type = "checkbox";
+                        checkbox.checked = !visibilityState.hidden.includes(
+                            m.id
+                        );
+                        checkbox.dataset.model = m.id;
+                        checkbox.addEventListener("change", () => {});
+                        label.appendChild(checkbox);
+                        label.appendChild(
+                            document.createTextNode(m.id)
+                        );
+                        grid.appendChild(label);
+                    });
+                    container.appendChild(card);
+                });
+            }
+
+            function setGroupVisibility(provider, visible) {
+                document
+                    .querySelectorAll(
+                        `#vg-${CSS.escape(provider)} input[type=checkbox]`
+                    )
+                    .forEach((cb) => {
+                        cb.checked = visible;
+                    });
+            }
+
+            async function saveModelVisibility() {
+                const checkboxes = document.querySelectorAll(
+                    "#visibility-groups input[type=checkbox][data-model]"
+                );
+                const seen = new Set();
+                const hidden = [];
+                checkboxes.forEach((cb) => {
+                    if (!cb.checked && !seen.has(cb.dataset.model)) {
+                        seen.add(cb.dataset.model);
+                        hidden.push(cb.dataset.model);
+                    }
+                });
+                try {
+                    const response = await fetch("/api/model-visibility", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ hidden }),
+                    });
+                    if (!response.ok) {
+                        throw new Error(await response.text());
+                    }
+                    const status = document.getElementById(
+                        "visibility-save-status"
+                    );
+                    if (status) {
+                        status.textContent =
+                            `Saved (${hidden.length} hidden) at ` +
+                            new Date().toLocaleTimeString();
+                    }
+                    notifySuccess("Model visibility saved");
+                    await loadModelVisibility();
+                } catch (error) {
+                    console.error("Failed to save model visibility:", error);
+                    notifyError("Failed to save visibility: " + error.message);
                 }
             }
 

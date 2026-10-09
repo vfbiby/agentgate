@@ -85,6 +85,10 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
             "/api/tier-mapping",
             get(get_tier_mapping).post(save_tier_mapping),
         )
+        .route(
+            "/api/model-visibility",
+            get(get_model_visibility).post(save_model_visibility),
+        )
         .route("/api/config", get(get_config))
         .route("/api/config", post(update_config))
         .route("/api/config/json", get(get_config_json))
@@ -507,6 +511,143 @@ async fn save_tier_mapping(
     })))
 }
 
+// ---------------------------------------------------------------------------
+// Model visibility (admin UI): which models show up in gateway discovery
+// (GET /v1/models). Persisted as an optional top-level `hidden_models = [...]`
+// key in ccm.toml. Visibility does NOT affect routing — hidden models stay
+// callable and remain selectable in tier mappings.
+// ---------------------------------------------------------------------------
+
+/// Read the `hidden_models` list from the raw config document (top-level key).
+fn read_hidden_models(doc: &str) -> Vec<String> {
+    toml::from_str::<toml::Value>(doc)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("hidden_models")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// Line index of a top-level `hidden_models = ...` assignment (before the
+/// first `[section]` header), if present.
+fn find_hidden_models_line(lines: &[String]) -> Option<usize> {
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            return None; // Reached a section header — key is absent.
+        }
+        if let Some(rest) = trimmed.strip_prefix("hidden_models") {
+            if rest.trim_start().starts_with('=') {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// GET /api/model-visibility — all registered models grouped by provider,
+/// with their current hidden state.
+async fn get_model_visibility(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let doc = std::fs::read_to_string(&state.config_path)
+        .map_err(|e| AppError::ParseError(format!("Failed to read config: {}", e)))?;
+    let hidden = read_hidden_models(&doc);
+
+    let config = state.config.read().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for provider_config in config.providers.iter().filter(|p| p.is_enabled()) {
+        for model in &provider_config.models {
+            if !seen.insert(model.clone()) {
+                continue;
+            }
+            models.push(serde_json::json!({
+                "id": model,
+                "provider": provider_config.name,
+                "hidden": hidden.contains(model),
+            }));
+        }
+    }
+
+    let mut hidden_sorted = hidden;
+    hidden_sorted.sort();
+    Ok(Json(serde_json::json!({ "models": models, "hidden": hidden_sorted })))
+}
+
+#[derive(serde::Deserialize)]
+struct ModelVisibilityUpdate {
+    hidden: Vec<String>,
+}
+
+/// POST /api/model-visibility — full replacement of the hidden list.
+async fn save_model_visibility(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<ModelVisibilityUpdate>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let registered: std::collections::HashSet<String> =
+        state.provider_registry.list_models().into_iter().collect();
+    for model in &update.hidden {
+        if !registered.contains(model) {
+            return Err(AppError::ParseError(format!(
+                "Model '{}' is not registered on any enabled provider",
+                model
+            )));
+        }
+    }
+
+    let config_path = &state.config_path;
+    let doc = std::fs::read_to_string(config_path)
+        .map_err(|e| AppError::ParseError(format!("Failed to read config: {}", e)))?;
+    let mut lines: Vec<String> = doc.lines().map(str::to_string).collect();
+
+    let kv = format!(
+        "hidden_models = [{}]",
+        update
+            .hidden
+            .iter()
+            .map(|m| format!("\"{}\"", m))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match find_hidden_models_line(&lines) {
+        Some(i) => lines[i] = kv,
+        None => {
+            let insert_at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            lines.insert(insert_at, kv);
+        }
+    }
+
+    let mut new_doc = lines.join("\n");
+    if !new_doc.ends_with('\n') {
+        new_doc.push('\n');
+    }
+    std::fs::write(config_path, new_doc)
+        .map_err(|e| AppError::ParseError(format!("Failed to write config: {}", e)))?;
+
+    info!(
+        "✅ Model visibility updated: {} hidden",
+        update.hidden.len()
+    );
+
+    // No hot reload needed: visibility is consulted from disk on each
+    // gateway discovery request and does not affect routing state.
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "hidden": update.hidden,
+    })))
+}
+
 /// Remove null values from JSON (TOML doesn't support null)
 fn remove_null_values(value: &mut serde_json::Value) {
     match value {
@@ -918,9 +1059,18 @@ async fn list_gateway_models(
     let mut data = Vec::new();
 
     let provider_configs = state.config.read().unwrap().providers.clone();
+    // Models hidden via the admin UI are excluded from discovery but stay
+    // routable (direct calls keep working).
+    let hidden: std::collections::HashSet<String> =
+        read_hidden_models(&std::fs::read_to_string(&state.config_path).unwrap_or_default())
+            .into_iter()
+            .collect();
     for provider_config in provider_configs.iter().filter(|p| p.is_enabled()) {
         for model in &provider_config.models {
             if !seen.insert(model.clone()) {
+                continue;
+            }
+            if hidden.contains(model) {
                 continue;
             }
             if state.provider_registry.get_provider_for_model(model).is_err() {
