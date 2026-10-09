@@ -2409,10 +2409,6 @@
                 if (!control) return;
                 control.innerHTML = "";
                 if (!isVisible) {
-                    const placeholder = document.createElement("span");
-                    placeholder.className = "text-gray-400";
-                    placeholder.textContent = "\u9690\u85cf";
-                    control.appendChild(placeholder);
                     return;
                 }
                 const makeRadio = (value, text) => {
@@ -2423,6 +2419,7 @@
                     radio.type = "radio";
                     radio.name = "ctx-" + model;
                     radio.value = value;
+                    radio.dataset.model = model;
                     radio.checked =
                         (value === "1m") === (row.dataset.ctx === "1m");
                     label.appendChild(radio);
@@ -2482,7 +2479,9 @@
                         '#visibility-groups input[type=radio][value="1m"]:checked'
                     )
                     .forEach((radio) => {
-                        oneM.push(radio.dataset.model);
+                        if (radio.dataset.model) {
+                            oneM.push(radio.dataset.model);
+                        }
                     });
                 try {
                     const response = await fetch("/api/model-visibility", {
