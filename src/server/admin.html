@@ -2356,12 +2356,15 @@
                     );
                     models.forEach((m) => {
                         const row = document.createElement("div");
-                        row.className = "flex items-center gap-4 text-sm text-gray-700";
+                        row.className =
+                            "flex items-center justify-between text-sm text-gray-700";
                         const isVisible = !visibilityState.hidden.includes(m.id);
                         const oneM = visibilityState.one_m.includes(m.id);
 
+                        // Left: visible checkbox + model name, adjacent.
                         const visibleLabel = document.createElement("label");
-                        visibleLabel.className = "flex items-center gap-2 w-56";
+                        visibleLabel.className =
+                            "flex items-center gap-2 cursor-pointer";
                         const visibleBox = document.createElement("input");
                         visibleBox.type = "checkbox";
                         visibleBox.checked = isVisible;
@@ -2376,10 +2379,15 @@
                             }
                         });
                         visibleLabel.appendChild(visibleBox);
-                        visibleLabel.appendChild(document.createTextNode("\u53ef\u89c1"));
+                        const name = document.createElement("span");
+                        name.className = "font-mono";
+                        name.textContent = m.id;
+                        visibleLabel.appendChild(name);
 
+                        // Right: 1M checkbox + short label.
                         const oneMLabel = document.createElement("label");
-                        oneMLabel.className = "flex items-center gap-2";
+                        oneMLabel.className =
+                            "flex items-center gap-1.5 cursor-pointer";
                         const oneMBox = document.createElement("input");
                         oneMBox.type = "checkbox";
                         oneMBox.checked = oneM;
@@ -2387,15 +2395,10 @@
                         oneMBox.dataset.model = m.id;
                         oneMBox.dataset.kind = "onem";
                         oneMLabel.appendChild(oneMBox);
-                        oneMLabel.appendChild(document.createTextNode("1M \u4e0a\u4e0b\u6587"));
-
-                        const name = document.createElement("span");
-                        name.className = "font-mono";
-                        name.textContent = m.id;
+                        oneMLabel.appendChild(document.createTextNode("1M"));
 
                         row.appendChild(visibleLabel);
                         row.appendChild(oneMLabel);
-                        row.appendChild(name);
                         grid.appendChild(row);
                     });
                     container.appendChild(card);
