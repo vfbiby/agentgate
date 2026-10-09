@@ -933,9 +933,25 @@ async fn list_gateway_models(
                     "display_name": model,
                 }));
             } else {
+                // Claude Code only accepts ids made of lowercase letters,
+                // digits and dashes — sanitize everything else to a dash
+                // (e.g. gpt-6.1-sol -> claude-gpt-6-1-sol). The router
+                // resolves these back to the real model via normalized
+                // comparison.
+                let slot_id: String = format!(
+                    "claude-{}",
+                    model
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        })
+                        .collect::<String>()
+                );
                 data.push(serde_json::json!({
                     "type": "model",
-                    "id": format!("claude-{}", model),
+                    "id": slot_id,
                     "display_name": model,
                 }));
             }

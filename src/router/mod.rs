@@ -2,7 +2,7 @@ use crate::cli::AppConfig;
 use crate::models::{AnthropicRequest, RouteDecision, RouteType, SystemPrompt};
 use anyhow::Result;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
 /// Router for intelligently selecting models based on request characteristics
@@ -14,6 +14,18 @@ pub struct Router {
     /// Model names exactly registered by an enabled provider. Auto-mapping
     /// must not rewrite these, otherwise listed models become unreachable.
     registered_models: HashSet<String>,
+    /// Normalized (alphanumerics-only) registered model name -> original name,
+    /// used to resolve `claude-` slot aliases whose ids were sanitized
+    /// (e.g. `claude-gpt-6-1-sol` -> `gpt-6.1-sol`).
+    slot_aliases: HashMap<String, String>,
+}
+
+/// Keep only ASCII alphanumerics, lowercased, for tolerant slot-alias matching.
+fn normalize_model_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 impl Router {
@@ -86,11 +98,17 @@ impl Router {
                 Some(Regex::new(r"(?i)claude.*haiku").expect("Invalid default background regex"))
             });
 
+        let slot_aliases: HashMap<String, String> = registered_models
+            .iter()
+            .map(|name| (normalize_model_name(name), name.clone()))
+            .collect();
+
         Self {
             config,
             auto_map_regex,
             background_regex,
             registered_models,
+            slot_aliases,
         }
     }
 
@@ -99,6 +117,8 @@ impl Router {
     pub fn route(&self, request: &mut AnthropicRequest) -> Result<RouteDecision> {
         // 0a. claude-* slot alias (gateway model discovery): a name that is
         // exactly "claude-" + a registered model resolves to that model.
+        // Sanitized slot ids (Claude Code only accepts [a-z0-9-] ids, so
+        // dots are turned into dashes) match via normalized comparison.
         // Exact registered names themselves take priority (see step 0).
         if let Some(inner) = request.model.strip_prefix("claude-") {
             if self.registered_models.contains(inner) {
@@ -107,6 +127,12 @@ impl Router {
                     request.model, inner
                 );
                 request.model = inner.to_string();
+            } else if let Some(original) = self.slot_aliases.get(&normalize_model_name(inner)) {
+                debug!(
+                    "🔀 Resolved sanitized slot alias '{}' -> '{}'",
+                    request.model, original
+                );
+                request.model = original.clone();
             }
         }
 
@@ -291,6 +317,34 @@ mod tests {
             system: None,
             tools: None,
         }
+    }
+
+    #[test]
+    fn test_slot_alias_resolution() {
+        let config = create_test_config();
+        let registered: HashSet<String> = ["gpt-6.1-sol", "claude-opus-5-5"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let router = Router::new(config, registered);
+
+        // Sanitized slot id (dot became a dash) resolves to the real model.
+        let mut request = create_simple_request("Hi");
+        request.model = "claude-gpt-6-1-sol".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "gpt-6.1-sol");
+
+        // Exact registered name takes priority over the alias mapping.
+        let mut request = create_simple_request("Hi");
+        request.model = "claude-opus-5-5".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "claude-opus-5-5");
+
+        // Unrelated claude-* names still auto-map to the default model.
+        let mut request = create_simple_request("Hi");
+        request.model = "claude-sonnet-9-9".to_string();
+        let decision = router.route(&mut request).unwrap();
+        assert_eq!(decision.model_name, "default.model");
     }
 
     #[test]
