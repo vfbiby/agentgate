@@ -3,7 +3,7 @@ mod oauth_handlers;
 
 use crate::cli::AppConfig;
 use crate::models::AnthropicRequest;
-use crate::router::Router;
+use crate::router::{normalize_model_name, Router};
 use crate::providers::ProviderRegistry;
 use crate::auth::TokenStore;
 use axum::{
@@ -535,15 +535,15 @@ fn read_hidden_models(doc: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Line index of a top-level `hidden_models = ...` assignment (before the
-/// first `[section]` header), if present.
-fn find_hidden_models_line(lines: &[String]) -> Option<usize> {
+/// Line index of a top-level `key = ...` assignment (before the first
+/// `[section]` header), if present.
+fn find_toplevel_kv_line(lines: &[String], key: &str) -> Option<usize> {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             return None; // Reached a section header — key is absent.
         }
-        if let Some(rest) = trimmed.strip_prefix("hidden_models") {
+        if let Some(rest) = trimmed.strip_prefix(key) {
             if rest.trim_start().starts_with('=') {
                 return Some(i);
             }
@@ -552,14 +552,78 @@ fn find_hidden_models_line(lines: &[String]) -> Option<usize> {
     None
 }
 
+/// Set (or insert) a top-level `key = ["a", "b"]` string-list assignment.
+fn set_toplevel_string_list(lines: &mut Vec<String>, key: &str, items: &[String]) {
+    let kv = format!(
+        "{} = [{}]",
+        key,
+        items
+            .iter()
+            .map(|m| format!("\"{}\"", m))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match find_toplevel_kv_line(lines, key) {
+        Some(i) => lines[i] = kv,
+        None => {
+            let insert_at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            lines.insert(insert_at, kv);
+        }
+    }
+}
+
+/// Sanitized gateway slot id for a model (lowercase [a-z0-9-] only).
+fn slot_id_for(model: &str) -> String {
+    format!(
+        "claude-{}",
+        model
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            })
+            .collect::<String>()
+    )
+}
+
 /// GET /api/model-visibility — all registered models grouped by provider,
 /// with their current hidden state.
 async fn get_model_visibility(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let doc = std::fs::read_to_string(&state.config_path)
+    let mut doc = std::fs::read_to_string(&state.config_path)
         .map_err(|e| AppError::ParseError(format!("Failed to read config: {}", e)))?;
+
+    // One-time migration: if `context_1m_models` is absent, seed it from the
+    // [1m] rows of an existing settings.json modelPicker (hand-written ones
+    // survive as the initial state).
+    if find_toplevel_kv_line(&doc.lines().map(str::to_string).collect::<Vec<_>>(), "context_1m_models")
+        .is_none()
+    {
+        let registered: std::collections::HashSet<String> =
+            state.provider_registry.list_models().into_iter().collect();
+        let seeded = seed_context_1m_from_settings(
+            &state.config_path.with_file_name("settings.json"),
+            &registered,
+        );
+        let mut lines: Vec<String> = doc.lines().map(str::to_string).collect();
+        set_toplevel_string_list(&mut lines, "context_1m_models", &seeded);
+        doc = lines.join("
+");
+        if !doc.ends_with('\n') {
+            doc.push('\n');
+        }
+        std::fs::write(&state.config_path, &doc)
+            .map_err(|e| AppError::ParseError(format!("Failed to write config: {}", e)))?;
+        info!("✅ Seeded context_1m_models from settings.json: {:?}", seeded);
+    }
+
     let hidden = read_hidden_models(&doc);
+    let one_m = read_string_list(&doc, "context_1m_models");
 
     let config = state.config.read().unwrap();
     let mut seen = std::collections::HashSet::new();
@@ -573,59 +637,149 @@ async fn get_model_visibility(
                 "id": model,
                 "provider": provider_config.name,
                 "hidden": hidden.contains(model),
+                "one_m": one_m.contains(model),
             }));
         }
     }
 
     let mut hidden_sorted = hidden;
     hidden_sorted.sort();
-    Ok(Json(serde_json::json!({ "models": models, "hidden": hidden_sorted })))
+    let mut one_m_sorted: Vec<String> = one_m.into_iter().collect();
+    one_m_sorted.sort();
+    Ok(Json(serde_json::json!({
+        "models": models,
+        "hidden": hidden_sorted,
+        "one_m": one_m_sorted,
+    })))
+}
+
+/// Read a top-level string-list key from the raw config document.
+fn read_string_list(doc: &str, key: &str) -> std::collections::HashSet<String> {
+    toml::from_str::<toml::Value>(doc)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(key)
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// Extract the [1m] rows of an existing settings.json modelPicker and map
+/// them back to registered model names (slot ids and suffixes normalized).
+fn seed_context_1m_from_settings(
+    settings_path: &std::path::Path,
+    registered: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(settings_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(options) = value
+        .get("modelPicker")
+        .and_then(|mp| mp.get("options"))
+        .and_then(|o| o.as_array())
+    else {
+        return Vec::new();
+    };
+
+    // Normalized registered names -> original.
+    let mut by_normalized: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for name in registered {
+        by_normalized.insert(normalize_model_name(name), name.clone());
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for option in options {
+        let Some(model) = option.get("model").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        if !model.to_ascii_lowercase().ends_with("[1m]") || model.len() < 4 {
+            continue;
+        }
+        let base = &model[..model.len() - 4];
+        let candidates = [
+            base.to_string(),
+            base.strip_prefix("claude-").unwrap_or(base).to_string(),
+        ];
+        for candidate in &candidates {
+            if registered.contains(candidate) {
+                if seen.insert(candidate.clone()) {
+                    out.push(candidate.clone());
+                }
+                break;
+            }
+            if let Some(original) = by_normalized.get(&normalize_model_name(candidate)) {
+                if seen.insert(original.clone()) {
+                    out.push(original.clone());
+                }
+                break;
+            }
+        }
+    }
+    out
 }
 
 #[derive(serde::Deserialize)]
 struct ModelVisibilityUpdate {
-    hidden: Vec<String>,
+    hidden: Option<Vec<String>>,
+    one_m: Option<Vec<String>>,
 }
 
-/// POST /api/model-visibility — full replacement of the hidden list.
+/// POST /api/model-visibility — full replacement of the hidden list and/or
+/// the 1M-context list. Also regenerates the modelPicker block of the
+/// sibling settings.json (other keys preserved; JSON parse-validated first).
 async fn save_model_visibility(
     State(state): State<Arc<AppState>>,
     Json(update): Json<ModelVisibilityUpdate>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let registered: std::collections::HashSet<String> =
         state.provider_registry.list_models().into_iter().collect();
-    for model in &update.hidden {
-        if !registered.contains(model) {
-            return Err(AppError::ParseError(format!(
-                "Model '{}' is not registered on any enabled provider",
-                model
-            )));
+    let validate = |models: &Option<Vec<String>>, what: &str| -> Result<(), AppError> {
+        if let Some(list) = models {
+            for model in list {
+                if !registered.contains(model) {
+                    return Err(AppError::ParseError(format!(
+                        "Model '{}' ({}) is not registered on any enabled provider",
+                        model, what
+                    )));
+                }
+            }
         }
-    }
+        Ok(())
+    };
+    validate(&update.hidden, "hidden")?;
+    validate(&update.one_m, "one_m")?;
 
     let config_path = &state.config_path;
     let doc = std::fs::read_to_string(config_path)
         .map_err(|e| AppError::ParseError(format!("Failed to read config: {}", e)))?;
     let mut lines: Vec<String> = doc.lines().map(str::to_string).collect();
 
-    let kv = format!(
-        "hidden_models = [{}]",
-        update
-            .hidden
-            .iter()
-            .map(|m| format!("\"{}\"", m))
+    // Resolve final sets: submitted values win, otherwise keep what's on disk.
+    let final_hidden = update.hidden.clone().unwrap_or_else(|| {
+        read_hidden_models(&doc).into_iter().collect::<Vec<_>>()
+    });
+    let final_one_m = update.one_m.clone().unwrap_or_else(|| {
+        read_string_list(&doc, "context_1m_models")
+            .into_iter()
             .collect::<Vec<_>>()
-            .join(", ")
-    );
-    match find_hidden_models_line(&lines) {
-        Some(i) => lines[i] = kv,
-        None => {
-            let insert_at = lines
-                .iter()
-                .position(|l| l.trim_start().starts_with('['))
-                .unwrap_or(lines.len());
-            lines.insert(insert_at, kv);
-        }
+    });
+
+    if let Some(list) = &update.hidden {
+        set_toplevel_string_list(&mut lines, "hidden_models", list);
+    }
+    if let Some(list) = &update.one_m {
+        set_toplevel_string_list(&mut lines, "context_1m_models", list);
     }
 
     let mut new_doc = lines.join("\n");
@@ -635,9 +789,20 @@ async fn save_model_visibility(
     std::fs::write(config_path, new_doc)
         .map_err(|e| AppError::ParseError(format!("Failed to write config: {}", e)))?;
 
+    // Regenerate the modelPicker block of settings.json from the final sets.
+    let config = state.config.read().unwrap();
+    let picker = generate_model_picker(
+        &config,
+        &final_hidden.into_iter().collect(),
+        &final_one_m.iter().cloned().collect(),
+    );
+    drop(config);
+    write_model_picker(&state.config_path.with_file_name("settings.json"), picker)?;
+
     info!(
-        "✅ Model visibility updated: {} hidden",
-        update.hidden.len()
+        "✅ Model visibility updated: {} hidden, {} one_m",
+        update.hidden.as_ref().map(|h| h.len()).unwrap_or(0),
+        update.one_m.as_ref().map(|h| h.len()).unwrap_or(0)
     );
 
     // No hot reload needed: visibility is consulted from disk on each
@@ -645,7 +810,67 @@ async fn save_model_visibility(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "hidden": update.hidden,
+        "one_m": update.one_m,
     })))
+}
+
+/// Build the modelPicker block: one row per visible model (config order).
+/// Non-Claude models are exposed as sanitized `claude-*` slot ids (with the
+/// `[1m]` suffix when opted in) and get `behavesAs` as a directory fallback.
+fn generate_model_picker(
+    config: &AppConfig,
+    hidden: &std::collections::HashSet<String>,
+    one_m: &std::collections::HashSet<String>,
+) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::new();
+    let mut options = Vec::new();
+    for provider_config in config.providers.iter().filter(|p| p.is_enabled()) {
+        for model in &provider_config.models {
+            if !seen.insert(model.clone()) {
+                continue;
+            }
+            if hidden.contains(model) {
+                continue;
+            }
+            let mut id = slot_id_for(model);
+            if one_m.contains(model) {
+                id.push_str("[1m]");
+            }
+            let mut row = serde_json::json!({
+                "model": id,
+                "label": model,
+                "description": format!("via {}", provider_config.name),
+            });
+            if !model.starts_with("claude-") {
+                row["behavesAs"] = serde_json::json!("claude-sonnet-5-5");
+            }
+            options.push(row);
+        }
+    }
+    serde_json::json!({
+        "options": options,
+        "replaceBuiltInOptions": true,
+    })
+}
+
+/// Rewrite only the modelPicker block of settings.json, preserving every
+/// other key. The file is JSON-parsed first; a parse failure aborts the write.
+fn write_model_picker(
+    settings_path: &std::path::Path,
+    picker: serde_json::Value,
+) -> Result<(), AppError> {
+    let text = match std::fs::read_to_string(settings_path) {
+        Ok(text) => text,
+        Err(_) => "{}".to_string(), // Missing file: start from an empty object.
+    };
+    let mut settings: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::ParseError(format!("settings.json failed to parse, not writing: {}", e)))?;
+    settings["modelPicker"] = picker;
+    let out = serde_json::to_string_pretty(&settings)
+        .map_err(|e| AppError::ParseError(format!("Failed to serialize settings: {}", e)))?;
+    std::fs::write(settings_path, out + "\n")
+        .map_err(|e| AppError::ParseError(format!("Failed to write settings.json: {}", e)))?;
+    Ok(())
 }
 
 /// Remove null values from JSON (TOML doesn't support null)
@@ -1088,20 +1313,9 @@ async fn list_gateway_models(
                 // (e.g. gpt-6.1-sol -> claude-gpt-6-1-sol). The router
                 // resolves these back to the real model via normalized
                 // comparison.
-                let slot_id: String = format!(
-                    "claude-{}",
-                    model
-                        .chars()
-                        .map(|c| if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '-'
-                        })
-                        .collect::<String>()
-                );
                 data.push(serde_json::json!({
                     "type": "model",
-                    "id": slot_id,
+                    "id": slot_id_for(model),
                     "display_name": model,
                 }));
             }

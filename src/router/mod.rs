@@ -21,7 +21,7 @@ pub struct Router {
 }
 
 /// Keep only ASCII alphanumerics, lowercased, for tolerant slot-alias matching.
-fn normalize_model_name(name: &str) -> String {
+pub fn normalize_model_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())

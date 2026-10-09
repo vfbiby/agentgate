@@ -2350,26 +2350,53 @@
                                 <button class="text-sm text-gray-500 hover:underline" onclick="setGroupVisibility('${escapeHtml(provider)}', false)">Select none</button>
                             </div>
                         </div>
-                        <div class="grid grid-cols-2 gap-2" id="vg-${escapeHtml(provider)}"></div>`;
+                        <div class="space-y-1" id="vg-${escapeHtml(provider)}"></div>`;
                     const grid = card.querySelector(
                         `#vg-${CSS.escape(provider)}`
                     );
                     models.forEach((m) => {
-                        const label = document.createElement("label");
-                        label.className =
-                            "flex items-center gap-2 text-sm text-gray-700";
-                        const checkbox = document.createElement("input");
-                        checkbox.type = "checkbox";
-                        checkbox.checked = !visibilityState.hidden.includes(
-                            m.id
-                        );
-                        checkbox.dataset.model = m.id;
-                        checkbox.addEventListener("change", () => {});
-                        label.appendChild(checkbox);
-                        label.appendChild(
-                            document.createTextNode(m.id)
-                        );
-                        grid.appendChild(label);
+                        const row = document.createElement("div");
+                        row.className = "flex items-center gap-4 text-sm text-gray-700";
+                        const isVisible = !visibilityState.hidden.includes(m.id);
+                        const oneM = visibilityState.one_m.includes(m.id);
+
+                        const visibleLabel = document.createElement("label");
+                        visibleLabel.className = "flex items-center gap-2 w-56";
+                        const visibleBox = document.createElement("input");
+                        visibleBox.type = "checkbox";
+                        visibleBox.checked = isVisible;
+                        visibleBox.dataset.model = m.id;
+                        visibleBox.dataset.kind = "visible";
+                        visibleBox.addEventListener("change", () => {
+                            const oneMBox = row.querySelector(
+                                'input[data-kind="onem"]'
+                            );
+                            if (oneMBox) {
+                                oneMBox.disabled = !visibleBox.checked;
+                            }
+                        });
+                        visibleLabel.appendChild(visibleBox);
+                        visibleLabel.appendChild(document.createTextNode("\u53ef\u89c1"));
+
+                        const oneMLabel = document.createElement("label");
+                        oneMLabel.className = "flex items-center gap-2";
+                        const oneMBox = document.createElement("input");
+                        oneMBox.type = "checkbox";
+                        oneMBox.checked = oneM;
+                        oneMBox.disabled = !isVisible;
+                        oneMBox.dataset.model = m.id;
+                        oneMBox.dataset.kind = "onem";
+                        oneMLabel.appendChild(oneMBox);
+                        oneMLabel.appendChild(document.createTextNode("1M \u4e0a\u4e0b\u6587"));
+
+                        const name = document.createElement("span");
+                        name.className = "font-mono";
+                        name.textContent = m.id;
+
+                        row.appendChild(visibleLabel);
+                        row.appendChild(oneMLabel);
+                        row.appendChild(name);
+                        grid.appendChild(row);
                     });
                     container.appendChild(card);
                 });
@@ -2381,7 +2408,15 @@
                         `#vg-${CSS.escape(provider)} input[type=checkbox]`
                     )
                     .forEach((cb) => {
-                        cb.checked = visible;
+                        if (cb.dataset.kind === "visible") {
+                            cb.checked = visible;
+                            const oneMBox = cb
+                                .closest("div")
+                                .querySelector('input[data-kind="onem"]');
+                            if (oneMBox) {
+                                oneMBox.disabled = !visible;
+                            }
+                        }
                     });
             }
 
@@ -2389,19 +2424,21 @@
                 const checkboxes = document.querySelectorAll(
                     "#visibility-groups input[type=checkbox][data-model]"
                 );
-                const seen = new Set();
                 const hidden = [];
+                const oneM = [];
                 checkboxes.forEach((cb) => {
-                    if (!cb.checked && !seen.has(cb.dataset.model)) {
-                        seen.add(cb.dataset.model);
+                    if (cb.dataset.kind === "visible" && !cb.checked) {
                         hidden.push(cb.dataset.model);
+                    }
+                    if (cb.dataset.kind === "onem" && cb.checked && !cb.disabled) {
+                        oneM.push(cb.dataset.model);
                     }
                 });
                 try {
                     const response = await fetch("/api/model-visibility", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ hidden }),
+                        body: JSON.stringify({ hidden, one_m: oneM }),
                     });
                     if (!response.ok) {
                         throw new Error(await response.text());
@@ -2411,7 +2448,7 @@
                     );
                     if (status) {
                         status.textContent =
-                            `Saved (${hidden.length} hidden) at ` +
+                            `Saved (${hidden.length} hidden, ${oneM.length} 1M) at ` +
                             new Date().toLocaleTimeString();
                     }
                     notifySuccess("Model visibility saved");
