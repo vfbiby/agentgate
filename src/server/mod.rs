@@ -20,11 +20,13 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use futures::stream::StreamExt;
 
-/// Application state shared across handlers
-#[derive(Clone)]
+/// Application state shared across handlers (always used behind `Arc`)
 pub struct AppState {
-    pub config: AppConfig,
-    pub router: Router,
+    /// Current runtime configuration. Held behind a lock so the admin UI can
+    /// hot-reload tier mappings without restarting the process.
+    pub config: std::sync::RwLock<AppConfig>,
+    /// Router rebuilt together with `config` (it embeds router settings).
+    pub router: std::sync::RwLock<Router>,
     pub provider_registry: Arc<ProviderRegistry>,
     pub token_store: TokenStore,
     pub config_path: std::path::PathBuf,
@@ -61,8 +63,8 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
     );
 
     let state = Arc::new(AppState {
-        config: config.clone(),
-        router,
+        config: std::sync::RwLock::new(config.clone()),
+        router: std::sync::RwLock::new(router),
         provider_registry,
         token_store,
         config_path,
@@ -79,6 +81,10 @@ pub async fn start_server(config: AppConfig, config_path: std::path::PathBuf) ->
         .route("/api/models", get(get_models))
         .route("/api/providers", get(get_providers))
         .route("/api/models-config", get(get_models_config))
+        .route(
+            "/api/tier-mapping",
+            get(get_tier_mapping).post(save_tier_mapping),
+        )
         .route("/api/config", get(get_config))
         .route("/api/config", post(update_config))
         .route("/api/config/json", get(get_config_json))
@@ -153,16 +159,17 @@ async fn get_models(State(_state): State<Arc<AppState>>) -> Result<Json<serde_js
 
 /// Get current routing configuration
 async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.config.read().unwrap();
     Json(serde_json::json!({
         "server": {
-            "host": state.config.server.host,
-            "port": state.config.server.port,
+            "host": config.server.host,
+            "port": config.server.port,
         },
         "router": {
-            "default": state.config.router.default,
-            "background": state.config.router.background,
-            "think": state.config.router.think,
-            "websearch": state.config.router.websearch,
+            "default": config.router.default,
+            "background": config.router.background,
+            "think": config.router.think,
+            "websearch": config.router.websearch,
         }
     }))
 }
@@ -220,30 +227,284 @@ async fn update_config(
 
 /// Get providers configuration
 async fn get_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.config.providers.clone())
+    Json(state.config.read().unwrap().providers.clone())
 }
 
 /// Get models configuration
 async fn get_models_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.config.models.clone())
+    Json(state.config.read().unwrap().models.clone())
 }
 
 /// Get full configuration as JSON (for admin UI)
 async fn get_config_json(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.config.read().unwrap();
     Json(serde_json::json!({
         "server": {
-            "host": state.config.server.host,
-            "port": state.config.server.port,
+            "host": config.server.host,
+            "port": config.server.port,
         },
         "router": {
-            "default": state.config.router.default,
-            "background": state.config.router.background,
-            "think": state.config.router.think,
-            "websearch": state.config.router.websearch,
+            "default": config.router.default,
+            "background": config.router.background,
+            "think": config.router.think,
+            "websearch": config.router.websearch,
         },
-        "providers": state.config.providers,
-        "models": state.config.models,
+        "providers": config.providers,
+        "models": config.models,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Tier mapping (admin UI): pick the backend model for each Claude Code tier
+// (Opus / Sonnet / Haiku buttons). Persisted in ccm.toml and hot-reloaded.
+// ---------------------------------------------------------------------------
+
+/// Wire model name emitted by Claude Code's Opus tier button.
+const TIER_OPUS_WIRE_NAME: &str = "claude-opus-5-5";
+/// Wire model name emitted by Claude Code's Sonnet tier button.
+const TIER_SONNET_WIRE_NAME: &str = "claude-sonnet-5-5";
+
+#[derive(serde::Deserialize)]
+struct TierMappingUpdate {
+    opus: String,
+    sonnet: String,
+    haiku: String,
+}
+
+/// First enabled provider whose model list contains `model`.
+fn find_provider_for_model(config: &AppConfig, model: &str) -> Option<String> {
+    config
+        .providers
+        .iter()
+        .filter(|p| p.is_enabled())
+        .find(|p| p.models.iter().any(|m| m == model))
+        .map(|p| p.name.clone())
+}
+
+/// Currently effective model for a tier wire name (mapping or the name itself).
+fn tier_current_model(config: &AppConfig, wire_name: &str) -> String {
+    config
+        .models
+        .iter()
+        .find(|m| m.name == wire_name)
+        .and_then(|m| m.mappings.iter().min_by_key(|mp| mp.priority))
+        .map(|mp| mp.actual_model.clone())
+        .unwrap_or_else(|| wire_name.to_string())
+}
+
+async fn get_tier_mapping(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let config = state.config.read().unwrap();
+    let mut models = state.provider_registry.list_models();
+    models.sort();
+    Ok(Json(serde_json::json!({
+        "opus": tier_current_model(&config, TIER_OPUS_WIRE_NAME),
+        "sonnet": tier_current_model(&config, TIER_SONNET_WIRE_NAME),
+        "haiku": config.router.background.clone(),
+        "models": models,
+    })))
+}
+
+/// Render a `[[models]]` entry text block for a tier wire name.
+fn models_entry_text(name: &str, provider: &str, actual_model: &str) -> String {
+    format!(
+        "[[models]]\nname = \"{}\"\n\n[[models.mappings]]\npriority = 1\nprovider = \"{}\"\nactual_model = \"{}\"\n",
+        name, provider, actual_model
+    )
+}
+
+/// Byte range (line indices, end-exclusive) of the `[[models]]` block whose
+/// `name` field equals `name`, or `None` if absent.
+fn find_models_block_range(lines: &[String], name: &str) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[[models]]" {
+            let start = i;
+            let mut j = i + 1;
+            let mut found = false;
+            while j < lines.len() {
+                let trimmed = lines[j].trim_start();
+                if !trimmed.starts_with('[') {
+                    // Ordinary key line inside the block.
+                    if let Some(v) = lines[j].trim().strip_prefix("name = ") {
+                        if v.trim().trim_matches('"') == name {
+                            found = true;
+                        }
+                    }
+                } else if trimmed.starts_with("[[models.") {
+                    // Sub-table of this entry (e.g. [[models.mappings]]) —
+                    // still part of the block.
+                } else {
+                    // Any other table header ends this block.
+                    break;
+                }
+                j += 1;
+            }
+            if found {
+                return Some((start, j));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Line index of `key = ...` inside the `[router]` section, if present.
+/// Exact key match (`background` does not match `background_default`).
+fn find_router_line(lines: &[String], key: &str) -> Option<usize> {
+    let mut in_router = false;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "[router]" {
+            in_router = true;
+            continue;
+        }
+        if in_router {
+            if trimmed.starts_with('[') {
+                return None;
+            }
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                if rest.trim_start().starts_with('=') {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn save_tier_mapping(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<TierMappingUpdate>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // 1. Resolve and validate selections ("": clear tier override).
+    let (opus_selection, sonnet_selection, haiku_selection) = {
+        let config = state.config.read().unwrap();
+
+        let resolve_mapping = |model: &str| -> Result<Option<(String, String)>, AppError> {
+            if model.is_empty() {
+                return Ok(None);
+            }
+            let provider = find_provider_for_model(&config, model).ok_or_else(|| {
+                AppError::ParseError(format!("Model '{}' is not registered on any enabled provider", model))
+            })?;
+            Ok(Some((provider, model.to_string())))
+        };
+
+        let opus = resolve_mapping(&update.opus)?;
+        let sonnet = resolve_mapping(&update.sonnet)?;
+
+        let haiku = if update.haiku.is_empty() {
+            None
+        } else if state.provider_registry.get_provider_for_model(&update.haiku).is_err() {
+            return Err(AppError::ParseError(format!(
+                "Model '{}' is not registered on any enabled provider",
+                update.haiku
+            )));
+        } else {
+            Some(update.haiku.clone())
+        };
+
+        (opus, sonnet, haiku)
+    };
+
+    // 2. Text-edit ccm.toml (preserves comments and untouched sections).
+    let config_path = &state.config_path;
+    let doc = std::fs::read_to_string(config_path)
+        .map_err(|e| AppError::ParseError(format!("Failed to read config: {}", e)))?;
+    let mut lines: Vec<String> = doc.lines().map(str::to_string).collect();
+
+    for (wire_name, selection) in [
+        (TIER_OPUS_WIRE_NAME, &opus_selection),
+        (TIER_SONNET_WIRE_NAME, &sonnet_selection),
+    ] {
+        match selection {
+            Some((provider, model)) => {
+                let entry = models_entry_text(wire_name, provider, model);
+                match find_models_block_range(&lines, wire_name) {
+                    Some((start, end)) => {
+                        lines.splice(
+                            start..end,
+                            entry.lines().map(str::to_string).collect::<Vec<_>>(),
+                        );
+                    }
+                    None => {
+                        if lines.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                            lines.push(String::new());
+                        }
+                        lines.extend(entry.lines().map(str::to_string));
+                    }
+                }
+            }
+            None => {
+                if let Some((start, end)) = find_models_block_range(&lines, wire_name) {
+                    lines.drain(start..end);
+                }
+            }
+        }
+    }
+
+    match haiku_selection {
+        Some(model) => {
+            // Remember the original background once, so "default" can restore it.
+            if find_router_line(&lines, "background_default").is_none() {
+                if let Some(i) = find_router_line(&lines, "background") {
+                    let original = lines[i].replacen("background", "background_default", 1);
+                    lines.insert(i + 1, original);
+                }
+            }
+            let line = format!("background = \"{}\"", model);
+            if let Some(i) = find_router_line(&lines, "background") {
+                lines[i] = line;
+            } else if let Some(i) = lines.iter().position(|l| l.trim() == "[router]") {
+                lines.insert(i + 1, line);
+            }
+        }
+        None => {
+            // Restore the remembered original background, if one was captured.
+            if let Some(i) = find_router_line(&lines, "background_default") {
+                let original = lines[i].replacen("background_default", "background", 1);
+                if let Some(bi) = find_router_line(&lines, "background") {
+                    lines[bi] = original;
+                } else if let Some(ri) = lines.iter().position(|l| l.trim() == "[router]") {
+                    lines.insert(ri + 1, original);
+                }
+                lines.remove(i);
+            }
+        }
+    }
+
+    let mut new_doc = lines.join("\n");
+    if !new_doc.ends_with('\n') {
+        new_doc.push('\n');
+    }
+
+    // 3. The edited document must parse as a valid AppConfig.
+    let new_config: AppConfig = toml::from_str(&new_doc)
+        .map_err(|e| AppError::ParseError(format!("Edited config failed to parse: {}", e)))?;
+
+    // 4. Persist.
+    std::fs::write(config_path, new_doc)
+        .map_err(|e| AppError::ParseError(format!("Failed to write config: {}", e)))?;
+
+    // 5. Hot reload: rebuild the router (it embeds router settings) and swap
+    // the runtime config in place — no process restart needed.
+    let registered_models: std::collections::HashSet<String> =
+        state.provider_registry.list_models().into_iter().collect();
+    let new_router = Router::new(new_config.clone(), registered_models);
+    *state.config.write().unwrap() = new_config;
+    *state.router.write().unwrap() = new_router;
+
+    info!("✅ Tier mapping saved and hot-reloaded (opus={:?}, sonnet={:?}, haiku={:?})",
+        update.opus, update.sonnet, update.haiku);
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "message": "Tier mapping saved and applied (hot reload)",
+    })))
 }
 
 /// Remove null values from JSON (TOML doesn't support null)
@@ -359,7 +620,7 @@ async fn update_config_json(
 async fn restart_server(State(state): State<Arc<AppState>>) -> Response {
     info!("🔄 Server restart requested via UI");
 
-    let port = state.config.server.port;
+    let port = state.config.read().unwrap().server.port;
 
     // Create a shell script to handle restart
     match create_and_execute_restart_script(port) {
@@ -483,6 +744,8 @@ async fn handle_openai_chat_completions(
     // 2. Route the request (may modify system prompt to remove CCM-SUBAGENT-MODEL tag)
     let decision = state
         .router
+        .read()
+        .unwrap()
         .route(&mut anthropic_request)
         .map_err(|e| AppError::RoutingError(e.to_string()))?;
 
@@ -492,7 +755,8 @@ async fn handle_openai_chat_completions(
     );
 
     // 3. Try model mappings with fallback (1:N mapping)
-    if let Some(model_config) = state.config.models.iter().find(|m| m.name == decision.model_name) {
+    let runtime_models = state.config.read().unwrap().models.clone();
+    if let Some(model_config) = runtime_models.iter().find(|m| m.name == decision.model_name) {
         info!("📋 Found {} provider mappings for model: {}", model_config.mappings.len(), decision.model_name);
 
         // Check for X-Provider header to override priority
@@ -642,15 +906,19 @@ fn sse_response_from_provider_stream(
 /// Handle GET /v1/models (Anthropic gateway model discovery).
 ///
 /// Lists the union of models exposed by all enabled providers (deduplicated,
-/// config order preserved), so clients like Claude Code can discover the real
-/// backend models. Only models resolvable to a provider are listed.
+/// config order preserved). Claude Code only offers non-`claude-*` gateway
+/// models inside its picker if they are presented under a `claude-*` id, so
+/// every non-Claude model is additionally exposed as a slot entry
+/// `claude-<model>` (display name stays the real model name); the bare
+/// non-Claude id is omitted to avoid duplicates.
 async fn list_gateway_models(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut seen = std::collections::HashSet::new();
     let mut data = Vec::new();
 
-    for provider_config in state.config.providers.iter().filter(|p| p.is_enabled()) {
+    let provider_configs = state.config.read().unwrap().providers.clone();
+    for provider_config in provider_configs.iter().filter(|p| p.is_enabled()) {
         for model in &provider_config.models {
             if !seen.insert(model.clone()) {
                 continue;
@@ -658,11 +926,19 @@ async fn list_gateway_models(
             if state.provider_registry.get_provider_for_model(model).is_err() {
                 continue;
             }
-            data.push(serde_json::json!({
-                "type": "model",
-                "id": model,
-                "display_name": model,
-            }));
+            if model.starts_with("claude-") {
+                data.push(serde_json::json!({
+                    "type": "model",
+                    "id": model,
+                    "display_name": model,
+                }));
+            } else {
+                data.push(serde_json::json!({
+                    "type": "model",
+                    "id": format!("claude-{}", model),
+                    "display_name": model,
+                }));
+            }
         }
     }
 
@@ -696,6 +972,8 @@ async fn handle_messages(
     // 2. Route the request (may modify system prompt to remove CCM-SUBAGENT-MODEL tag)
     let decision = state
         .router
+        .read()
+        .unwrap()
         .route(&mut request_for_routing)
         .map_err(|e| AppError::RoutingError(e.to_string()))?;
 
@@ -705,7 +983,8 @@ async fn handle_messages(
     );
 
     // 3. Try model mappings with fallback (1:N mapping)
-    if let Some(model_config) = state.config.models.iter().find(|m| m.name == decision.model_name) {
+    let runtime_models = state.config.read().unwrap().models.clone();
+    if let Some(model_config) = runtime_models.iter().find(|m| m.name == decision.model_name) {
         info!("📋 Found {} provider mappings for model: {}", model_config.mappings.len(), decision.model_name);
 
         // Check for X-Provider header to override priority
@@ -896,6 +1175,8 @@ async fn handle_count_tokens(
     };
     let decision = state
         .router
+        .read()
+        .unwrap()
         .route(&mut routing_request)
         .map_err(|e| AppError::RoutingError(e.to_string()))?;
 
@@ -905,7 +1186,8 @@ async fn handle_count_tokens(
     );
 
     // 3. Try model mappings with fallback (1:N mapping)
-    if let Some(model_config) = state.config.models.iter().find(|m| m.name == decision.model_name) {
+    let runtime_models = state.config.read().unwrap().models.clone();
+    if let Some(model_config) = runtime_models.iter().find(|m| m.name == decision.model_name) {
         info!("📋 Found {} provider mappings for token counting: {}", model_config.mappings.len(), decision.model_name);
 
         // Sort mappings by priority

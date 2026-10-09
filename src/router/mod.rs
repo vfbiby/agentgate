@@ -97,6 +97,19 @@ impl Router {
     /// Route an incoming request to the appropriate model
     /// Priority: websearch > subagent > think > background > auto-map > default
     pub fn route(&self, request: &mut AnthropicRequest) -> Result<RouteDecision> {
+        // 0a. claude-* slot alias (gateway model discovery): a name that is
+        // exactly "claude-" + a registered model resolves to that model.
+        // Exact registered names themselves take priority (see step 0).
+        if let Some(inner) = request.model.strip_prefix("claude-") {
+            if self.registered_models.contains(inner) {
+                debug!(
+                    "🔀 Resolved slot alias '{}' -> '{}'",
+                    request.model, inner
+                );
+                request.model = inner.to_string();
+            }
+        }
+
         // Save original model for background task detection
         let original_model = request.model.clone();
 

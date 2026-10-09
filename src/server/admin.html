@@ -187,6 +187,13 @@
                             Router
                         </button>
                         <button
+                            onclick="showTab('tiers')"
+                            id="tab-tiers"
+                            class="w-full text-left px-4 py-3 rounded-lg hover:bg-gray-50 transition-colors text-[15px] text-gray-600"
+                        >
+                            Tier Mapping
+                        </button>
+                        <button
                             onclick="showTab('settings')"
                             id="tab-settings"
                             class="w-full text-left px-4 py-3 rounded-lg hover:bg-gray-50 transition-colors text-[15px] text-gray-600"
@@ -1607,6 +1614,55 @@
                     </form>
                 </div>
 
+                <!-- Tier Mapping Tab -->
+                <div id="content-tiers" class="tab-content hidden">
+                    <h1 class="text-4xl font-bold mb-3">Tier Mapping</h1>
+                    <p class="text-gray-600 text-lg mb-12">
+                        Pick the backend model behind each Claude Code tier
+                        button. Saving applies immediately (hot reload) and
+                        persists in ccm.toml.
+                    </p>
+
+                    <div class="card mb-6">
+                        <h2 class="text-xl font-bold mb-6">Opus Tier</h2>
+                        <p class="text-gray-600 mb-6">
+                            Requests with model
+                            <code>claude-opus-5-5</code>
+                        </p>
+                        <select id="tier-opus" class="input-field"></select>
+                    </div>
+
+                    <div class="card mb-6">
+                        <h2 class="text-xl font-bold mb-6">Sonnet Tier</h2>
+                        <p class="text-gray-600 mb-6">
+                            Requests with model
+                            <code>claude-sonnet-5-5</code>
+                        </p>
+                        <select id="tier-sonnet" class="input-field"></select>
+                    </div>
+
+                    <div class="card mb-6">
+                        <h2 class="text-xl font-bold mb-6">Haiku Tier</h2>
+                        <p class="text-gray-600 mb-6">
+                            Requests with model
+                            <code>claude-haiku-*</code>
+                            (routed via the background tier)
+                        </p>
+                        <select id="tier-haiku" class="input-field"></select>
+                    </div>
+
+                    <button
+                        onclick="saveTierMapping()"
+                        class="btn-primary text-sm py-3 px-6"
+                    >
+                        💾 Save Tier Mapping
+                    </button>
+                    <div
+                        id="tier-save-status"
+                        class="mt-4 text-sm text-gray-600"
+                    ></div>
+                </div>
+
                 <!-- Settings Tab -->
                 <div id="content-settings" class="tab-content hidden">
                     <h1 class="text-4xl font-bold mb-3">Settings</h1>
@@ -2198,6 +2254,75 @@
                     loadSettingsTab();
                 } else if (tab === "router") {
                     loadRouterTab();
+                } else if (tab === "tiers") {
+                    loadTierMapping();
+                }
+            }
+
+            // Tier Mapping (Claude Code tier buttons -> backend models)
+            async function loadTierMapping() {
+                try {
+                    const response = await fetch("/api/tier-mapping");
+                    if (!response.ok) throw new Error("HTTP " + response.status);
+                    const data = await response.json();
+                    const tiers = [
+                        ["tier-opus", data.opus],
+                        ["tier-sonnet", data.sonnet],
+                        ["tier-haiku", data.haiku],
+                    ];
+                    for (const [id, current] of tiers) {
+                        const select = document.getElementById(id);
+                        if (!select) continue;
+                        select.innerHTML = "";
+                        const defaultOption = document.createElement("option");
+                        defaultOption.value = "";
+                        defaultOption.textContent =
+                            id === "tier-haiku"
+                                ? "Default (clear background override)"
+                                : "Default (use registered model)";
+                        select.appendChild(defaultOption);
+                        (data.models || []).forEach((model) => {
+                            const option = document.createElement("option");
+                            option.value = model;
+                            option.textContent = model;
+                            if (model === current) option.selected = true;
+                            select.appendChild(option);
+                        });
+                    }
+                } catch (error) {
+                    console.error("Failed to load tier mapping:", error);
+                    notifyError("Failed to load tier mapping");
+                }
+            }
+
+            async function saveTierMapping() {
+                const payload = {
+                    opus: document.getElementById("tier-opus").value,
+                    sonnet: document.getElementById("tier-sonnet").value,
+                    haiku: document.getElementById("tier-haiku").value,
+                };
+                try {
+                    const response = await fetch("/api/tier-mapping", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    if (!response.ok) {
+                        const body = await response.text();
+                        throw new Error(body);
+                    }
+                    const status = document.getElementById("tier-save-status");
+                    if (status) {
+                        status.textContent =
+                            "Saved and applied (hot reload) at " +
+                            new Date().toLocaleTimeString();
+                    }
+                    notifySuccess("Tier mapping saved and applied");
+                    await loadConfig();
+                    await loadTierMapping();
+                } catch (error) {
+                    console.error("Failed to save tier mapping:", error);
+                    notifyError("Failed to save tier mapping: " + error.message);
                 }
             }
 
